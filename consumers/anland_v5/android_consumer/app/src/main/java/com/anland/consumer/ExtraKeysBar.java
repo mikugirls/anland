@@ -40,7 +40,8 @@ public class ExtraKeysBar extends GridLayout {
     public interface Sender {
         void key(int action, int evdev);   // action: 0 = down, 1 = up
         void text(String s);
-        void toggleKeyboard();
+        void toggleKeyboard();          // toggle the system IME (soft keyboard)
+        void toggleVirtualKeyboard();   // toggle the floating virtual keyboard
         void openSettings();
     }
 
@@ -55,17 +56,24 @@ public class ExtraKeysBar extends GridLayout {
     private static final int BG_COLOR = 0x00000000;
     private static final int ACTIVE_BG_COLOR = 0xFF7F7F7F;
 
+    // Bar backdrop: nearly opaque in the default (display-resizing) mode; more
+    // translucent in floating mode so the desktop shows through behind the keys.
+    private static final int BAR_BG_COLOR = 0xCC000000;
+    private static final int BAR_BG_FLOATING_COLOR = 0x99000000;
+
     private static final long REPEAT_DELAY_MS = 80;
 
-    private static final int TYPE_KEY = 0;       // evdev down+up
-    private static final int TYPE_TEXT = 1;      // text out
-    private static final int TYPE_MODIFIER = 2;  // CTRL/ALT/SHIFT toggle
-    private static final int TYPE_KEYBOARD = 3;  // toggle IME
-    private static final int TYPE_SETTINGS = 4;  // open settings
+    private static final int TYPE_KEY = 0;        // evdev down+up
+    private static final int TYPE_TEXT = 1;       // text out
+    private static final int TYPE_MODIFIER = 2;   // CTRL/ALT/SHIFT toggle
+    private static final int TYPE_KEYBOARD = 3;   // toggle system IME
+    private static final int TYPE_SETTINGS = 4;   // open settings
+    private static final int TYPE_VKEYBOARD = 5;  // toggle floating virtual keyboard
 
     // Glyphs for icon-style keys.
     private static final String GLYPH_KEYBOARD = "⌨";  // ⌨
     private static final String GLYPH_SETTINGS = "⚙";  // ⚙
+    private static final String GLYPH_VKEYBOARD = "VK"; // pull-up popup on ⌨
 
     private static final int ROWS = 2;
     private static final int COLS = 8;
@@ -97,7 +105,7 @@ public class ExtraKeysBar extends GridLayout {
         "      {\"label\":\"↑\",    \"type\":\"key\",      \"code\":103, \"repeat\":true},\n" +
         "      {\"label\":\"END\",  \"type\":\"key\",      \"code\":107, \"repeat\":true},\n" +
         "      {\"label\":\"PGUP\", \"type\":\"key\",      \"code\":104, \"repeat\":true},\n" +
-        "      {\"label\":\"⚙\",    \"type\":\"settings\"}\n" +
+        "      {\"label\":\"⌨\",    \"type\":\"keyboard\", \"popup\":{\"label\":\"VK\",\"type\":\"vkeyboard\"}}\n" +
         "    ],\n" +
         "    [\n" +
         "      {\"label\":\"TAB\",  \"type\":\"key\",      \"code\":15},\n" +
@@ -107,7 +115,7 @@ public class ExtraKeysBar extends GridLayout {
         "      {\"label\":\"↓\",    \"type\":\"key\",      \"code\":108, \"repeat\":true},\n" +
         "      {\"label\":\"→\",    \"type\":\"key\",      \"code\":106, \"repeat\":true},\n" +
         "      {\"label\":\"PGDN\", \"type\":\"key\",      \"code\":109, \"repeat\":true},\n" +
-        "      {\"label\":\"⌨\",    \"type\":\"keyboard\"}\n" +
+        "      {\"label\":\"⚙\",    \"type\":\"settings\"}\n" +
         "    ]\n" +
         "  ]\n" +
         "}\n";
@@ -135,7 +143,8 @@ public class ExtraKeysBar extends GridLayout {
         static Key text(String d) { return new Key(d, TYPE_TEXT, 0, d, false, null); }
         static Key textPopup(String d, Key popup) { return new Key(d, TYPE_TEXT, 0, d, false, popup); }
         static Key mod(String d, int evdev) { return new Key(d, TYPE_MODIFIER, evdev, null, false, null); }
-        static Key kbd(String d) { return new Key(d, TYPE_KEYBOARD, 0, null, false, null); }
+        static Key kbd(String d, Key popup) { return new Key(d, TYPE_KEYBOARD, 0, null, false, popup); }
+        static Key vkbd(String d) { return new Key(d, TYPE_VKEYBOARD, 0, null, false, null); }
         static Key settings(String d) { return new Key(d, TYPE_SETTINGS, 0, null, false, null); }
     }
 
@@ -173,6 +182,7 @@ public class ExtraKeysBar extends GridLayout {
         if (json != null && !json.trim().isEmpty()) {
             try {
                 parsed = parseLayout(json);
+                if (parsed.length == 0) parsed = null;  // empty layout: use default
             } catch (JSONException e) {
                 parsed = null;  // fall through to the built-in default
             }
@@ -186,12 +196,21 @@ public class ExtraKeysBar extends GridLayout {
 
         setColumnCount(mCols);
         setRowCount(mRows);
-        setBackgroundColor(0xCC000000);
+        setBackgroundColor(BAR_BG_COLOR);
         buildKeys();
     }
 
     /** Number of rows in the active layout, used by the host to size the bar. */
     public int getRowCount() { return mRows; }
+
+    /**
+     * Switch the bar backdrop between the default (nearly opaque) and floating
+     * (translucent) appearance. In floating mode the bar overlays the display
+     * instead of compressing it, so the desktop should remain partly visible.
+     */
+    public void setFloating(boolean floating) {
+        setBackgroundColor(floating ? BAR_BG_FLOATING_COLOR : BAR_BG_COLOR);
+    }
 
     /** The editable default layout template (also used by SettingsActivity). */
     public static String defaultLayoutJson() { return DEFAULT_LAYOUT_JSON; }
@@ -206,8 +225,6 @@ public class ExtraKeysBar extends GridLayout {
             return "Empty (the built-in default will be used)";
         try {
             Key[][] rows = parseLayout(json);
-            int cols = 0;
-            for (Key[] r : rows) cols = Math.max(cols, r.length);
             if (rows.length == 0) return "No rows defined";
             return null;
         } catch (JSONException e) {
@@ -236,7 +253,7 @@ public class ExtraKeysBar extends GridLayout {
                 Key.rep("↓", EV_DOWN),
                 Key.rep("→", EV_RIGHT),
                 Key.rep("PGDN", EV_PAGEDOWN),
-                Key.kbd(GLYPH_KEYBOARD),
+                Key.kbd(GLYPH_KEYBOARD, Key.vkbd(GLYPH_VKEYBOARD)),
             },
         };
     }
@@ -259,20 +276,20 @@ public class ExtraKeysBar extends GridLayout {
     private static Key parseKey(JSONObject o) throws JSONException {
         String label = o.optString(J_LABEL, "");
         String type = o.optString(J_TYPE, "key");
+        Key popup = o.has(J_POPUP) ? parseKey(o.getJSONObject(J_POPUP)) : null;
         switch (type) {
-            case "text": {
-                Key popup = o.has(J_POPUP) ? parseKey(o.getJSONObject(J_POPUP)) : null;
+            case "text":
                 return new Key(label, TYPE_TEXT, 0, o.optString(J_TEXT, label), false, popup);
-            }
             case "modifier":
-                return new Key(label, TYPE_MODIFIER, o.optInt(J_CODE, 0), null, false, null);
-            case "keyboard":
-                return new Key(label, TYPE_KEYBOARD, 0, null, false, null);
+                return new Key(label, TYPE_MODIFIER, o.optInt(J_CODE, 0), null, false, popup);
+            case "keyboard": 
+                return new Key(label, TYPE_KEYBOARD, 0, null, false, popup);
+            case "vkeyboard":
+                return new Key(label, TYPE_VKEYBOARD, 0, null, false, popup);
             case "settings":
-                return new Key(label, TYPE_SETTINGS, 0, null, false, null);
+                return new Key(label, TYPE_SETTINGS, 0, null, false, popup);
             case "key":
             default: {
-                Key popup = o.has(J_POPUP) ? parseKey(o.getJSONObject(J_POPUP)) : null;
                 return new Key(label, TYPE_KEY, o.optInt(J_CODE, 0), null,
                                o.optBoolean(J_REPEAT, false), popup);
             }
@@ -368,6 +385,9 @@ public class ExtraKeysBar extends GridLayout {
         switch (key.type) {
             case TYPE_KEYBOARD:
                 mSender.toggleKeyboard();
+                return;
+            case TYPE_VKEYBOARD:
+                mSender.toggleVirtualKeyboard();
                 return;
             case TYPE_SETTINGS:
                 mSender.openSettings();

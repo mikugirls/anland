@@ -1,7 +1,9 @@
 package com.anland.consumer;
 
 import android.app.Activity;
+import android.content.Intent;
 import android.content.SharedPreferences;
+import android.net.Uri;
 import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.Rect;
@@ -28,6 +30,11 @@ import android.widget.SeekBar; // ===== 新增导入
 import android.widget.Spinner;
 import android.widget.Switch;
 import android.widget.TextView;
+import android.widget.Toast;
+
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 
 
 public class SettingsActivity extends Activity {
@@ -45,6 +52,7 @@ public class SettingsActivity extends Activity {
     private static final String KEY_AUTO_SHOW_EXTRA_KEYS = "auto_show_extra_keys";
     private static final String KEY_BACK_OPENS_EXTRA_KEYS = "back_opens_extra_keys";
     private static final String KEY_EXTRA_KEYS_LAYOUT = "extra_keys_layout";
+    private static final String KEY_KEYBOARD_FLOATING = "keyboard_floating";
     private static final String DEFAULT_SOCKET_PATH = "/data/local/tmp/display_daemon.sock";
     private static final int UNBOUND = -1;
 
@@ -75,6 +83,10 @@ public class SettingsActivity extends Activity {
     private TextView statusText;
     private CountDownTimer listenTimer;
     private boolean isListening = false;
+
+    // Custom extra-keys layout editor (JSON), and the SAF file-picker request code.
+    private EditText layoutInput;
+    private static final int REQ_PICK_LAYOUT = 2001;
 
     // Android keycode → human-readable name
     private static final SparseArray<String> KEY_NAMES = new SparseArray<>();
@@ -221,6 +233,28 @@ public class SettingsActivity extends Activity {
         backOpensExtraKeysHint.setPadding(0, dp(4), 0, dp(8));
         root.addView(backOpensExtraKeysHint);
 
+        // === Keyboard floating ===
+        Switch keyboardFloatingSwitch = new Switch(this);
+        keyboardFloatingSwitch.setText("Keyboard floating (overlay display)");
+        keyboardFloatingSwitch.setTextSize(14);
+        keyboardFloatingSwitch.setPadding(0, dp(16), 0, 0);
+        keyboardFloatingSwitch.setChecked(prefs.getBoolean(KEY_KEYBOARD_FLOATING, false));
+        keyboardFloatingSwitch.setOnCheckedChangeListener((v, checked) ->
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(KEY_KEYBOARD_FLOATING, checked).apply());
+        root.addView(keyboardFloatingSwitch);
+
+        TextView keyboardFloatingHint = new TextView(this);
+        keyboardFloatingHint.setText("When ON, the soft keyboard and the extra keys bar "
+            + "float over the display area instead of shrinking it; the bar uses a "
+            + "translucent background and rises with the keyboard, but the display is "
+            + "not resized. When OFF, the original behaviour (display shrinks to make "
+            + "room) is kept. Takes effect on next return to the desktop.");
+        keyboardFloatingHint.setTextSize(12);
+        keyboardFloatingHint.setTextColor(Color.GRAY);
+        keyboardFloatingHint.setPadding(0, dp(4), 0, dp(8));
+        root.addView(keyboardFloatingHint);
+
         // === Custom extra-keys layout (JSON) ===
         TextView layoutHeader = new TextView(this);
         layoutHeader.setText("Custom Extra Keys Layout");
@@ -229,7 +263,7 @@ public class SettingsActivity extends Activity {
         layoutHeader.setPadding(0, dp(24), 0, dp(8));
         root.addView(layoutHeader);
 
-        final EditText layoutInput = new EditText(this);
+        layoutInput = new EditText(this);
         layoutInput.setTypeface(Typeface.MONOSPACE);
         layoutInput.setTextSize(12);
         layoutInput.setGravity(Gravity.TOP | Gravity.START);
@@ -259,16 +293,26 @@ public class SettingsActivity extends Activity {
             }
         });
 
+        LinearLayout layoutButtons = new LinearLayout(this);
+        layoutButtons.setOrientation(LinearLayout.HORIZONTAL);
+
         Button loadDefaultBtn = new Button(this);
         loadDefaultBtn.setText("Load default template");
         loadDefaultBtn.setOnClickListener(v ->
             layoutInput.setText(ExtraKeysBar.defaultLayoutJson()));
-        root.addView(loadDefaultBtn);
+        layoutButtons.addView(loadDefaultBtn);
+
+        Button loadFileBtn = new Button(this);
+        loadFileBtn.setText("Load from file…");
+        loadFileBtn.setOnClickListener(v -> pickLayoutFile());
+        layoutButtons.addView(loadFileBtn);
+
+        root.addView(layoutButtons);
 
         TextView layoutHint = new TextView(this);
         layoutHint.setText("Define the extra-keys bar as JSON: \"rows\" is an array of "
             + "rows, each an array of keys. A key has a \"label\" and a \"type\" "
-            + "(key/text/modifier/keyboard/settings). \"key\"/\"modifier\" take an evdev "
+            + "(key/text/modifier/keyboard/vkeyboard/settings). \"key\"/\"modifier\" take an evdev "
             + "\"code\"; \"text\" takes \"text\"; any key may add \"repeat\":true or a "
             + "nested \"popup\". Invalid JSON falls back to the default. Takes effect on "
             + "next return to the desktop.");
@@ -685,6 +729,51 @@ public class SettingsActivity extends Activity {
         finishListening(keyCode);
         Log.i(TAG, "Bound keycode: " + keyCode);
         return true;
+    }
+
+    // Launch the system document picker to load a layout JSON from any provider
+    // (Downloads, Drive, etc.). Uses SAF, so no storage permission is required.
+    private void pickLayoutFile() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        intent.putExtra(Intent.EXTRA_MIME_TYPES,
+            new String[]{"application/json", "text/plain"});
+        try {
+            startActivityForResult(intent, REQ_PICK_LAYOUT);
+        } catch (android.content.ActivityNotFoundException e) {
+            Toast.makeText(this, "No file picker available", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_PICK_LAYOUT || resultCode != RESULT_OK || data == null)
+            return;
+        Uri uri = data.getData();
+        if (uri == null) return;
+        String text = readTextFromUri(uri);
+        if (text == null) {
+            Toast.makeText(this, "Could not read file", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        // setText flows through the editor's TextWatcher, which persists + validates.
+        if (layoutInput != null) layoutInput.setText(text);
+    }
+
+    private String readTextFromUri(Uri uri) {
+        try (InputStream in = getContentResolver().openInputStream(uri);
+             ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
+            if (in == null) return null;
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = in.read(buf)) != -1) bos.write(buf, 0, n);
+            return new String(bos.toByteArray(), StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            Log.w(TAG, "readTextFromUri failed", e);
+            return null;
+        }
     }
 
     // Reflect the validity of the custom layout JSON inline under the editor.

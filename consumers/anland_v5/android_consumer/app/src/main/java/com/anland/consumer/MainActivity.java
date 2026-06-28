@@ -34,6 +34,7 @@ import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.util.DisplayMetrics;   // ADDED
 
 import java.nio.charset.StandardCharsets;
 
@@ -69,6 +70,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final String KEY_AUTO_SHOW_EXTRA_KEYS = "auto_show_extra_keys";
     private static final String KEY_BACK_OPENS_EXTRA_KEYS = "back_opens_extra_keys";
     private static final String KEY_EXTRA_KEYS_LAYOUT = "extra_keys_layout";
+    // When on, the IME and extra-keys bar float over the display instead of
+    // shrinking it: the bar rides up with the keyboard but the surface keeps
+    // its full size. See relayout() and buildExtraKeysBar().
+    private static final String KEY_KEYBOARD_FLOATING = "keyboard_floating";
+    private boolean mKeyboardFloating = false;
     private EditText hiddenInput;
     private InputMethodManager imm;
     private int mImeBottom = 0;   // last IME bottom inset
@@ -80,6 +86,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private String mAppliedLayoutJson = "";
 
     public static MainActivity sInstance;
+
+    // ADDED: VirtualKeyboardView instance
+    private VirtualKeyboardView virtualKeyboardView;
 
     // evdev keycodes (linux/input-event-codes.h) for the editing keys a soft
     // keyboard emits as key events rather than text.
@@ -162,8 +171,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private native void nativeSendTextInput(byte[] data);
     private native void nativeSetMicEnabled(boolean enabled);
     private native void nativeSetAudioLatency(int speakerMs, int micMs);
-    private native void nativeInitCameraService();
-    private native void nativeDestroyCameraService();
     // Called from native event thread to set clipboard text on Android
     public void nativeSetClipboardText(String text) {
         ClipboardManager cm = getSystemService(ClipboardManager.class);
@@ -301,7 +308,31 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // count / height) comes from the user's JSON config; see buildExtraKeysBar.
         mRoot = root;
         mDensity = getResources().getDisplayMetrics().density;
+        mKeyboardFloating = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .getBoolean(KEY_KEYBOARD_FLOATING, false);
         buildExtraKeysBar();
+
+        // ADDED: Create VirtualKeyboardView (hidden initially)
+        virtualKeyboardView = new VirtualKeyboardView(this);
+        virtualKeyboardView.setVisibility(View.GONE);
+        virtualKeyboardView.setOnKeyEventListener(new VirtualKeyboardView.OnKeyEventListener() {
+            @Override
+            public void onKeyDown(int scanCode) {
+                nativeSendKey(0, scanCode);
+            }
+            @Override
+            public void onKeyUp(int scanCode) {
+                nativeSendKey(1, scanCode);
+            }
+        });
+        // Add to root with no gravity – we will position manually.
+        root.addView(virtualKeyboardView, new FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.NO_GRAVITY
+        ));
+        // Let the view measure itself first, then position it bottom-center.
+        virtualKeyboardView.post(() -> positionVirtualKeyboard());
 
         setContentView(root);
         surfaceView.getHolder().addCallback(this);
@@ -328,6 +359,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         updateScreenSize();
         mouseX = screenWidth / 2f;
         mouseY = screenHeight / 2f;
+    }
+
+    // ADDED: Helper to position virtual keyboard at bottom-center
+    private void positionVirtualKeyboard() {
+        if (virtualKeyboardView == null) return;
+        int w = virtualKeyboardView.getMeasuredWidth();
+        int h = virtualKeyboardView.getMeasuredHeight();
+        if (w <= 0 || h <= 0) {
+            virtualKeyboardView.post(this::positionVirtualKeyboard);
+            return;
+        }
+        DisplayMetrics dm = getResources().getDisplayMetrics();
+        float x = (dm.widthPixels - w) / 2f;
+        float y = dm.heightPixels - h - dpToPx(50); // 50dp margin from bottom
+        virtualKeyboardView.setX(x);
+        virtualKeyboardView.setY(y);
+    }
+
+    private int dpToPx(int dp) {
+        return (int) (dp * getResources().getDisplayMetrics().density);
     }
 
     private void setupFullscreen() {
@@ -361,6 +412,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             .getString(KEY_EXTRA_KEYS_LAYOUT, "");
         if (!layoutJson.equals(mAppliedLayoutJson))
             rebuildExtraKeysBar();
+
+        // Pick up a Keyboard-floating toggle made in Settings: update the bar's
+        // backdrop and re-run the layout so the surface margin tracks the new mode.
+        mKeyboardFloating = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .getBoolean(KEY_KEYBOARD_FLOATING, false);
+        if (extraKeysBar != null)
+            extraKeysBar.setFloating(mKeyboardFloating);
+        relayout();
 
         // Sync extra-keys bar visibility with the settings switches. With auto-show
         // ON the bar tracks the keyboard (hidden now if the IME isn't up); with it
@@ -411,7 +470,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     protected void onDestroy() {
         super.onDestroy();
         if (cameraInited) {
-            nativeDestroyCameraService();
+            CameraServices.nativeDestroyCameraService();
             cameraInited = false;
         }
     }
@@ -431,7 +490,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             return;
         if (checkSelfPermission(Manifest.permission.CAMERA)
                 == PackageManager.PERMISSION_GRANTED) {
-            nativeInitCameraService();
+            CameraServices.nativeInitCameraService(this);
             cameraInited = true;
         } else {
             requestPermissions(new String[]{Manifest.permission.CAMERA}, REQ_CAMERA);
@@ -480,8 +539,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         } else if (requestCode == REQ_CAMERA) {
             boolean granted = grantResults.length > 0
                     && grantResults[0] == PackageManager.PERMISSION_GRANTED;
-            if (granted && !cameraInited) {
-                nativeInitCameraService();
+            if (granted && !cameraInited && getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .getBoolean(KEY_CAMERA_ENABLED, false)) {
+                CameraServices.nativeInitCameraService(this);
                 cameraInited = true;
             }
         }
@@ -777,7 +837,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private void relayout() {
         boolean barVisible = extraKeysBar != null && extraKeysBar.getVisibility() == View.VISIBLE;
         int barH = barVisible ? mBarHeight : 0;
-        int target = mImeBottom + barH;
+        // Floating mode: keyboard + bar overlay the display, so the surface keeps
+        // its full size (target 0). Default mode: shrink the surface above both.
+        int target = mKeyboardFloating ? 0 : (mImeBottom + barH);
 
         FrameLayout.LayoutParams lp =
             (FrameLayout.LayoutParams) surfaceView.getLayoutParams();
@@ -809,12 +871,30 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             @Override public void text(String s) {
                 if (!s.isEmpty()) nativeSendTextInput(s.getBytes(StandardCharsets.UTF_8));
             }
-            @Override public void toggleKeyboard() { MainActivity.this.toggleKeyboard(); }
+            // Tapping the ⌨ key keeps the original behaviour: toggle the system IME.
+            @Override public void toggleKeyboard() { toggleSystemKeyboard(); }
+            // Pulling up on the ⌨ key toggles the floating virtual keyboard.
+            @Override public void toggleVirtualKeyboard() {
+                if (virtualKeyboardView.getVisibility() == View.VISIBLE) {
+                    virtualKeyboardView.setVisibility(View.GONE);
+                } else {
+                    virtualKeyboardView.setVisibility(View.VISIBLE);
+                    virtualKeyboardView.bringToFront();
+                    // Re-position it (in case screen size changed)
+                    positionVirtualKeyboard();
+                    // Hide the system IME to avoid overlap with the floating keyboard.
+                    InputMethodManager imm = getSystemService(InputMethodManager.class);
+                    if (imm != null && getCurrentFocus() != null) {
+                        imm.hideSoftInputFromWindow(getCurrentFocus().getWindowToken(), 0);
+                    }
+                }
+            }
             @Override public void openSettings() {
                 startActivity(new Intent(MainActivity.this, SettingsActivity.class));
             }
         });
         mBarHeight = Math.round(37.5f * mDensity * extraKeysBar.getRowCount());
+        extraKeysBar.setFloating(mKeyboardFloating);
         extraKeysBar.setVisibility(View.GONE);
         mRoot.addView(extraKeysBar, new FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, mBarHeight, Gravity.BOTTOM));
@@ -856,7 +936,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         hiddenInput.setEnabled(false);
     }
 
-    private void toggleKeyboard() {
+    // Toggle the system IME (soft keyboard). Driven by the ⌨ bar key tap and the
+    // user-bound hardware keycode.
+    private void toggleSystemKeyboard() {
         if (imm == null) imm = getSystemService(InputMethodManager.class);
         if (imm == null) return;
         if (isImeVisible()) {
@@ -931,7 +1013,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         int boundKeycode = prefs.getInt(KEY_BOUND_KEYCODE, -1);
         if (boundKeycode != -1 && keyCode == boundKeycode) {
-            toggleKeyboard();
+            toggleSystemKeyboard();   // Keep original bound key behavior (system IME)
             return true;
         }
 
