@@ -13,6 +13,7 @@ import android.content.pm.PackageManager;
 import android.hardware.display.DisplayManager;
 import android.content.SharedPreferences;
 import android.graphics.Color;
+import android.graphics.Point;
 import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
@@ -501,6 +502,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         isTouchpadMode = prefs.getBoolean(KEY_TOUCHPAD_MODE, false);
         mouseAccelStrength = prefs.getFloat(KEY_MOUSE_ACCEL, 1.0f);
         mouseAccelStrength = Math.max(0.5f, Math.min(10.0f, mouseAccelStrength));
+
+        // ===== 修改：更新屏幕尺寸并限制鼠标位置 =====
+        updateScreenSize();
+        mouseX = clamp(mouseX, 0, screenWidth);
+        mouseY = clamp(mouseY, 0, screenHeight);
+        resetSmoothing();
     }
 
     @Override
@@ -632,6 +639,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     public void surfaceDestroyed(SurfaceHolder holder) {
         surfaceReady = false;
         nativeStop();
+    }
+
+    // ===== 新增：处理屏幕旋转事件，更新尺寸和鼠标边界 =====
+    @Override
+    public void onConfigurationChanged(android.content.res.Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        updateScreenSize();
+        mouseX = clamp(mouseX, 0, screenWidth);
+        mouseY = clamp(mouseY, 0, screenHeight);
+        resetSmoothing();
     }
 
     private void initHiddenInput() {
@@ -1585,10 +1602,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return Math.max(min, Math.min(max, value));
     }
 
+    // ===== 修改：使用 DecorView 尺寸（修复虚拟鼠标边界） =====
     private void updateScreenSize() {
-        android.graphics.Point size = new android.graphics.Point();
-        getWindowManager().getDefaultDisplay().getSize(size);
-        screenWidth = size.x;
-        screenHeight = size.y;
+        View decorView = getWindow().getDecorView();
+        screenWidth = decorView.getWidth();
+        screenHeight = decorView.getHeight();
+        if (screenWidth <= 0 || screenHeight <= 0) {
+            // 如果还未布局，回退到 Display 尺寸（极少数情况）
+            Point size = new Point();
+            getWindowManager().getDefaultDisplay().getSize(size);
+            screenWidth = size.x;
+            screenHeight = size.y;
+        }
     }
 }
