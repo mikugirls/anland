@@ -2,13 +2,13 @@ name: Build Daemon and Magisk Module
 
 on:
   push:
-    branches: [ main ]
+    branches: [ '**' ]
     paths:
         - '.github/workflows/build_daemon.yml'
         - 'daemon/**'
         - 'magisk_module/**'
   pull_request:
-    branches: [ main ]
+    branches: [ '**' ]
     paths:
         - '.github/workflows/build_daemon.yml'
         - 'daemon/**'
