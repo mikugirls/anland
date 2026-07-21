@@ -62,7 +62,11 @@ jobs:
         working-directory: consumers/anland_v5/android_consumer
         run: |
           sed -i 's/android:screenOrientation="fullSensor"/android:screenOrientation="sensorLandscape"/g' app/src/main/AndroidManifest.xml
-          ./gradlew clean assembleRelease
+          ./gradlew clean assembleRelease \
+            -Pandroid.injected.signing.store.file="$HOME/.android/debug.keystore" \
+            -Pandroid.injected.signing.store.password=android \
+            -Pandroid.injected.signing.key.alias=androiddebugkey \
+            -Pandroid.injected.signing.key.password=android
           cp app/build/outputs/apk/release/app-release.apk app/build/outputs/apk/release/anland-v5-landscape.apk
 
       - name: Upload APK (Landscape)
