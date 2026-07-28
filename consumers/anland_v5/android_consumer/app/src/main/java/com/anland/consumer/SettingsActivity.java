@@ -67,6 +67,7 @@ public class SettingsActivity extends Activity {
     // ===== 新增：触摸板 Key =====
     private static final String KEY_TOUCHPAD_MODE = "touchpad_mode";
     private static final String KEY_MOUSE_ACCEL = "mouse_speed";
+    private static final String KEY_POINTER_CAPTURE = "pointer_capture";
 
     // Latency presets: target buffer in ms (0 = auto). The user-visible labels live
     // in the R.array.latency_labels string-array, parallel to this array.
@@ -596,6 +597,25 @@ public class SettingsActivity extends Activity {
         touchpadHint.setPadding(0, dp(4), 0, dp(12));
         root.addView(touchpadHint);
 
+        // External mouse pointer capture.  This is opt-in because it changes
+        // Android's mouse event mode from absolute coordinates to relative motion.
+        Switch pointerCaptureSwitch = new Switch(this);
+        pointerCaptureSwitch.setText(R.string.pointer_capture_switch);
+        pointerCaptureSwitch.setTextSize(14);
+        pointerCaptureSwitch.setPadding(0, dp(8), 0, 0);
+        pointerCaptureSwitch.setChecked(prefs.getBoolean(KEY_POINTER_CAPTURE, false));
+        pointerCaptureSwitch.setOnCheckedChangeListener((v, checked) ->
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                        .putBoolean(KEY_POINTER_CAPTURE, checked).apply());
+        root.addView(pointerCaptureSwitch);
+
+        TextView pointerCaptureHint = new TextView(this);
+        pointerCaptureHint.setText(R.string.pointer_capture_hint);
+        pointerCaptureHint.setTextSize(12);
+        pointerCaptureHint.setTextColor(Color.GRAY);
+        pointerCaptureHint.setPadding(0, dp(4), 0, dp(12));
+        root.addView(pointerCaptureHint);
+
         // 鼠标加速度（灵敏度）—— 范围 0.5 ~ 10.0
         LinearLayout accelLayout = new LinearLayout(this);
         accelLayout.setOrientation(LinearLayout.VERTICAL);
@@ -842,6 +862,22 @@ public class SettingsActivity extends Activity {
     hint.setTextColor(Color.GRAY);
     hint.setPadding(0, dp(4), 0, 0);
     root.addView(hint);
+
+    Switch autoStretchSwitch = new Switch(this);
+    autoStretchSwitch.setText(R.string.auto_stretch_switch);
+    autoStretchSwitch.setTextSize(14);
+    autoStretchSwitch.setPadding(0, dp(16), 0, 0);
+    autoStretchSwitch.setChecked(prefs.getBoolean("auto_stretch", true));
+    autoStretchSwitch.setOnCheckedChangeListener((v, checked) ->
+        prefs.edit().putBoolean("auto_stretch", checked).apply());
+    root.addView(autoStretchSwitch);
+
+    TextView autoStretchHint = new TextView(this);
+    autoStretchHint.setText(R.string.auto_stretch_hint);
+    autoStretchHint.setTextSize(12);
+    autoStretchHint.setTextColor(Color.GRAY);
+    autoStretchHint.setPadding(0, dp(4), 0, 0);
+    root.addView(autoStretchHint);
     }
 
     // Maps a res_preset_labels index to {width, height}, or null for the index-0
