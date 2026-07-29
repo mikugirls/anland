@@ -10,7 +10,6 @@ import android.app.PendingIntent;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
-import android.graphics.Matrix;
 import android.hardware.display.DisplayManager;
 import android.content.SharedPreferences;
 import android.os.Build;
@@ -120,19 +119,31 @@ public class MainActivity extends Activity
     // ==================== 触摸板相关设置 ====================
     public static final String KEY_TOUCHPAD_MODE = "touchpad_mode";
     public static final String KEY_MOUSE_ACCEL = "mouse_speed"; // 名称仍为 speed，实际控制加速度强度
+    // Two-finger scroll tuning, shared by the on-screen and captured touchpads.
+    public static final String KEY_SCROLL_SPEED = "scroll_speed";
+    public static final String KEY_SCROLL_REVERSE = "scroll_reverse";
+    // Multiples of touchSlop; see Touchpad.setGestureThresholds.
+    public static final String KEY_SCROLL_THRESHOLD = "touchpad_scroll_threshold";
+    public static final String KEY_MOVE_THRESHOLD = "touchpad_move_threshold";
+    // Magnifies declined gestures forwarded as touch; see Touchpad.setGestureScale.
+    public static final String KEY_GESTURE_SCALE = "touchpad_gesture_scale";
     // Capture an external mouse/touchpad as a relative pointer so it cannot reach
     // the Android screen edges. This is deliberately opt-in: existing installations
     // keep the old absolute-pointer behaviour until the user enables it.
     public static final String KEY_POINTER_CAPTURE = "pointer_capture";
 
-    // Routing gate: when on, non-mouse touches go to the virtual touchpad.
+    // Routing gate: when on, non-mouse touches go to the on-screen touchpad.
     private boolean isTouchpadMode = true;
-    // Finger-gesture touchpad (relative motion, taps, drag, two-finger scroll).
-    private VirtualTouchpad virtualTouchpad;
-    // Reuses the original VirtualTouchpad gesture state machine for raw
-    // SOURCE_TOUCHPAD events. Its movement output is intentionally ignored;
-    // raw relative axes still go through the capture-specific cursor adapter.
-    private VirtualTouchpad capturedTouchpadRecognizer;
+    // The two touch devices, same gesture logic, different input space (see
+    // Touchpad): the on-screen one reads the screen, the captured one reads a
+    // physical pad's own coordinate range.
+    private Touchpad screenTouchpad;
+    // Its movement output is intentionally dropped: a captured pad reports reliable
+    // relative axes, which drive the cursor from handleCapturedTouchpadEvent below.
+    private Touchpad capturedTouchpad;
+    // Device the captured instance's input bounds were taken from, so the motion
+    // ranges are only looked up when the pad actually changes.
+    private int capturedPadDeviceId = -1;
 
     // Pointer-capture state. Android delivers captured mouse/touchpad events
     // directly to the view hierarchy, bypassing
@@ -152,14 +163,13 @@ public class MainActivity extends Activity
     private float pointerY = Float.NaN;
 
     // Raw hardware-touchpad coordinate state while pointer capture is active.
-    // Gesture recognition itself is shared with VirtualTouchpad above.
+    // Gesture recognition itself belongs to Touchpad above.
     private float capturedTouchpadAccel = 1.0f;
     private boolean capturedTouchpadBaselineValid = false;
     private int capturedTouchpadBaselinePointers = 0;
     private float capturedTouchpadLastCentroidX = 0f;
     private float capturedTouchpadLastCentroidY = 0f;
     private final float[] capturedTouchpadResolvedDelta = new float[2];
-    private final Matrix capturedTouchpadTransform = new Matrix();
 
     static {
         // Loads the single shared .so backing MainActivity, Native and
@@ -291,11 +301,9 @@ public class MainActivity extends Activity
             android.system.StructStat st = android.system.Os.stat(path);
             return android.system.OsConstants.S_ISSOCK(st.st_mode);
         } catch (android.system.ErrnoException e) {
-            // 权限不足（EACCES）时，假定 socket 存在（常见于容器/root 环境）
             if (e.errno == android.system.OsConstants.EACCES) {
                 return true;
             }
-            // 其他错误（如 ENOENT 文件不存在）按实际情况返回 false
             return false;
         }
     }
@@ -502,32 +510,9 @@ public class MainActivity extends Activity
         // ===== 加载触摸板设置 =====
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         isTouchpadMode = prefs.getBoolean(KEY_TOUCHPAD_MODE, false);
-        virtualTouchpad = new VirtualTouchpad(this, mNative);
-        capturedTouchpadRecognizer = new VirtualTouchpad(this, mNative,
-                new VirtualTouchpad.Output() {
-                    @Override
-                    public void onMotion(float dx, float dy) {
-                        // Cursor motion is handled from AXIS_RELATIVE_X/Y below.
-                        // Keeping this callback empty lets the original class
-                        // remain the single source of truth for tap/drag/scroll
-                        // state without duplicating its movement output.
-                    }
-
-                    @Override
-                    public void onScroll(int axis, float value) {
-                        if (mNative != null)
-                            mNative.sendMouseScroll(axis, value);
-                    }
-
-                    @Override
-                    public void onButton(int button, boolean pressed) {
-                        if (mNative != null)
-                            mNative.sendMouseButton(button, pressed);
-                    }
-                });
-        capturedTouchpadAccel = Math.max(0.5f,
-                Math.min(10.0f, prefs.getFloat(KEY_MOUSE_ACCEL, 1.0f)));
-        virtualTouchpad.setAccelStrength(capturedTouchpadAccel);
+        screenTouchpad = new Touchpad(this, new TouchpadOutput(true), true);
+        capturedTouchpad = new Touchpad(this, new TouchpadOutput(false), false);
+        applyTouchpadPrefs(prefs);
         pointerCaptureEnabled = prefs.getBoolean(KEY_POINTER_CAPTURE, false);
 
         // Requesting capture before the window is attached is a no-op. The post
@@ -623,6 +608,125 @@ public class MainActivity extends Activity
 
     private void setupCursorHiding() {
         surfaceView.setPointerIcon(PointerIcon.getSystemIcon(this, PointerIcon.TYPE_NULL));
+    }
+
+    /**
+     * Everything a {@link Touchpad} produces, for either instance: both act on the
+     * same cursor and the same remote.
+     *
+     * emitMotion is the one difference. A captured pad's cursor comes from its
+     * relative axes (see processCapturedTouchpadMotionSample), which are reported in
+     * screen pixels and do not depend on the pad's own coordinate range, so that
+     * instance's recognized motion is dropped rather than applied twice.
+     */
+    private final class TouchpadOutput implements Touchpad.Output {
+        private final boolean emitMotion;
+
+        TouchpadOutput(boolean emitMotion) {
+            this.emitMotion = emitMotion;
+        }
+
+        @Override
+        public void onMotion(float dx, float dy) {
+            if (emitMotion)
+                movePointerBy(dx, dy);
+        }
+
+        @Override
+        public void onScroll(int axis, float value) {
+            if (mNative != null)
+                mNative.sendMouseScroll(axis, value);
+        }
+
+        @Override
+        public void onButton(int button, boolean pressed) {
+            if (mNative != null)
+                mNative.sendMouseButton(button, pressed);
+        }
+
+        @Override
+        public void onTouch(int action, int pointerId, float x, float y) {
+            if (mNative == null)
+                return;
+            float[] coords = convertToNativeCoords(x, y);
+            mNative.sendTouch(action, coords[0], coords[1], pointerId);
+        }
+
+        @Override
+        public void onTouchFrame() {
+            if (mNative != null)
+                mNative.sendTouchFrame();
+        }
+
+        @Override
+        public float cursorX() {
+            ensurePointerPosition();
+            return pointerX;
+        }
+
+        @Override
+        public float cursorY() {
+            ensurePointerPosition();
+            return pointerY;
+        }
+    }
+
+    /**
+     * Push the touchpad tuning preferences to both instances. Called from onCreate
+     * and again on resume, so edits made in Settings take effect on return.
+     */
+    private void applyTouchpadPrefs(SharedPreferences prefs) {
+        capturedTouchpadAccel = Math.max(0.5f,
+                Math.min(10.0f, prefs.getFloat(KEY_MOUSE_ACCEL, 1.0f)));
+        float scrollSpeed = prefs.getFloat(KEY_SCROLL_SPEED,
+                Touchpad.DEFAULT_SCROLL_SPEED);
+        boolean scrollReversed = prefs.getBoolean(KEY_SCROLL_REVERSE, false);
+        float scrollFactor = prefs.getFloat(KEY_SCROLL_THRESHOLD,
+                Touchpad.DEFAULT_SCROLL_THRESHOLD_FACTOR);
+        float moveFactor = prefs.getFloat(KEY_MOVE_THRESHOLD,
+                Touchpad.DEFAULT_MOVE_THRESHOLD_FACTOR);
+        float gestureScale = prefs.getFloat(KEY_GESTURE_SCALE,
+                Touchpad.DEFAULT_GESTURE_SCALE);
+
+        Touchpad[] touchpads = {screenTouchpad, capturedTouchpad};
+        for (Touchpad pad : touchpads) {
+            if (pad == null)
+                continue;
+            pad.setAccelStrength(capturedTouchpadAccel);
+            pad.setScrollSpeed(scrollSpeed);
+            pad.setScrollReversed(scrollReversed);
+            pad.setGestureThresholds(scrollFactor, moveFactor);
+            pad.setGestureScale(gestureScale);
+        }
+    }
+
+    /**
+     * Keep both instances' coordinate spaces current. The on-screen touchpad reads
+     * the view itself, so its input space is the output; a physical pad's is its own
+     * motion range, looked up once per device.
+     */
+    private void updateTouchpadBounds(MotionEvent capturedEvent) {
+        int width = pointerViewWidth();
+        int height = pointerViewHeight();
+        if (screenTouchpad != null) {
+            screenTouchpad.setInputBounds(0f, 0f, width, height);
+            screenTouchpad.setOutputSize(width, height);
+        }
+        if (capturedTouchpad == null)
+            return;
+        capturedTouchpad.setOutputSize(width, height);
+        if (capturedEvent == null || capturedEvent.getDeviceId() == capturedPadDeviceId)
+            return;
+        InputDevice.MotionRange xRange = capturedPadRange(capturedEvent,
+                MotionEvent.AXIS_X);
+        InputDevice.MotionRange yRange = capturedPadRange(capturedEvent,
+                MotionEvent.AXIS_Y);
+        if (xRange == null || yRange == null
+                || xRange.getRange() <= 0f || yRange.getRange() <= 0f)
+            return;
+        capturedPadDeviceId = capturedEvent.getDeviceId();
+        capturedTouchpad.setInputBounds(xRange.getMin(), yRange.getMin(),
+                xRange.getRange(), yRange.getRange());
     }
 
     /** Keep the window's pointer-capture state in sync with the saved setting. */
@@ -796,10 +900,10 @@ public class MainActivity extends Activity
             // Relative mouse samples can be batched.  Consume every historical
             // sample so fast movements do not lose deltas between frames.
             for (int i = 0; i < event.getHistorySize(); i++) {
-                sendCapturedMouseMotion(event.getHistoricalX(0, i),
+                movePointerBy(event.getHistoricalX(0, i),
                         event.getHistoricalY(0, i));
             }
-            sendCapturedMouseMotion(event.getX(), event.getY());
+            movePointerBy(event.getX(), event.getY());
         }
 
         if (action == MotionEvent.ACTION_SCROLL) {
@@ -822,8 +926,8 @@ public class MainActivity extends Activity
     }
 
     /**
-     * Feed raw capture events through the original VirtualTouchpad recognizer,
-     * while keeping raw relative-axis motion in the capture-specific backend.
+     * Feed raw capture events to the captured {@link Touchpad}, while keeping raw
+     * relative-axis motion in the capture-specific cursor backend.
      */
     private boolean handleCapturedTouchpadEvent(MotionEvent event) {
         int action = event.getActionMasked();
@@ -835,44 +939,43 @@ public class MainActivity extends Activity
                 || ((action == MotionEvent.ACTION_POINTER_UP
                     || action == MotionEvent.ACTION_UP)
                     && (event.getFlags() & MotionEvent.FLAG_CANCELED) != 0);
-        int classification = event.getClassification();
-        boolean unsupportedGesture = pointerCount >= 3
-                || classification == CLASSIFICATION_PINCH
-                || classification == CLASSIFICATION_MULTI_FINGER_SWIPE;
         boolean explicitScroll = (action == MotionEvent.ACTION_MOVE
                 || action == MotionEvent.ACTION_HOVER_MOVE)
                 && hasCapturedTouchpadScrollAxes(event);
         boolean scrollEvent = action == MotionEvent.ACTION_SCROLL || explicitScroll;
 
-        if (canceled || unsupportedGesture) {
-            if (capturedTouchpadRecognizer != null)
-                capturedTouchpadRecognizer.cancel();
+        // Multi-finger gestures are not filtered out here: the Touchpad sees every
+        // contact count and forwards whatever it does not implement as touch itself.
+        // cancel() also releases any touches it has already forwarded, which the
+        // first three branches all need.
+        if (canceled) {
+            if (capturedTouchpad != null)
+                capturedTouchpad.cancel();
             capturedTouchpadBaselineValid = false;
         } else if (scrollEvent) {
             // Absolute capture normally supplies raw pointer coordinates, but a
             // few drivers still emit scroll axes. They must cancel a pending tap
             // before its final ACTION_UP.
-            if (capturedTouchpadRecognizer != null)
-                capturedTouchpadRecognizer.cancel();
+            if (capturedTouchpad != null)
+                capturedTouchpad.cancel();
             for (int i = 0; i < event.getHistorySize(); i++)
                 sendCapturedTouchpadScrollAxes(event, i);
             sendCapturedTouchpadScrollAxes(event, -1);
             capturedTouchpadBaselineValid = false;
         } else if (hasButton) {
-            if (capturedTouchpadRecognizer != null)
-                capturedTouchpadRecognizer.cancel();
-        } else if (capturedTouchpadRecognizer != null) {
-            MotionEvent gestureEvent = normalizeCapturedTouchpadEvent(event);
-            try {
-                capturedTouchpadRecognizer.onTouch(gestureEvent);
-            } finally {
-                gestureEvent.recycle();
-            }
+            if (capturedTouchpad != null)
+                capturedTouchpad.cancel();
+        } else if (capturedTouchpad != null) {
+            updateTouchpadBounds(event);
+            capturedTouchpad.onTouch(event);
         }
 
         // A physical button cancels tap recognition, but it must not stop the
-        // relative cursor stream: touchpad click-drag still needs motion.
-        if (!canceled && !unsupportedGesture && !scrollEvent) {
+        // relative cursor stream: touchpad click-drag still needs motion. While a
+        // declined gesture is being forwarded as touch the cursor stays put, so its
+        // tail (fingers lifting back to one) cannot drag it away.
+        if (!canceled && !scrollEvent
+                && (capturedTouchpad == null || !capturedTouchpad.isForwardingTouch())) {
             switch (action) {
                 case MotionEvent.ACTION_DOWN:
                     setCapturedTouchpadBaseline(event, -1);
@@ -916,39 +1019,14 @@ public class MainActivity extends Activity
         sendCapturedTouchpadMotion(fallback[0], fallback[1]);
     }
 
-    /**
-     * Convert device-specific pad coordinates to view pixels for the original
-     * recognizer. SOURCE_CLASS_POSITION ignores MotionEvent transforms on newer
-     * Android releases, so use a temporary touchscreen source on the copy.
-     */
-    private MotionEvent normalizeCapturedTouchpadEvent(MotionEvent event) {
-        MotionEvent copy = MotionEvent.obtain(event);
-        copy.setSource(InputDevice.SOURCE_TOUCHSCREEN);
-
-        int width = pointerViewWidth();
-        int height = pointerViewHeight();
+    /** Pad axis range, preferring the touchpad source over the device-wide one. */
+    private InputDevice.MotionRange capturedPadRange(MotionEvent event, int axis) {
         InputDevice device = event.getDevice();
-        InputDevice.MotionRange xRange = device == null ? null
-                : device.getMotionRange(MotionEvent.AXIS_X,
-                        InputDevice.SOURCE_TOUCHPAD);
-        InputDevice.MotionRange yRange = device == null ? null
-                : device.getMotionRange(MotionEvent.AXIS_Y,
-                        InputDevice.SOURCE_TOUCHPAD);
-        if (device != null && xRange == null)
-            xRange = device.getMotionRange(MotionEvent.AXIS_X);
-        if (device != null && yRange == null)
-            yRange = device.getMotionRange(MotionEvent.AXIS_Y);
-
-        if (width > 0 && height > 0 && xRange != null && yRange != null
-                && xRange.getRange() > 0f && yRange.getRange() > 0f) {
-            float sx = width / xRange.getRange();
-            float sy = height / yRange.getRange();
-            capturedTouchpadTransform.setScale(sx, sy);
-            capturedTouchpadTransform.postTranslate(-xRange.getMin() * sx,
-                    -yRange.getMin() * sy);
-            copy.transform(capturedTouchpadTransform);
-        }
-        return copy;
+        if (device == null)
+            return null;
+        InputDevice.MotionRange range = device.getMotionRange(
+                axis, InputDevice.SOURCE_TOUCHPAD);
+        return range != null ? range : device.getMotionRange(axis);
     }
 
     /** Use absolute pad coordinates only when a driver omits the relative axes. */
@@ -1000,7 +1078,7 @@ public class MainActivity extends Activity
         float scale = 1.0f + (capturedTouchpadAccel - 1.0f)
                 * (speed / (1.0f + speed));
         scale = Math.max(0.3f, Math.min(10.0f, scale));
-        sendCapturedMouseMotion(dx * scale, dy * scale);
+        movePointerBy(dx * scale, dy * scale);
     }
 
     private void sendCapturedTouchpadScrollAxes(MotionEvent event, int historyPos) {
@@ -1082,15 +1160,19 @@ public class MainActivity extends Activity
     }
 
     private void resetCapturedTouchpadGesture() {
-        if (capturedTouchpadRecognizer != null)
-            capturedTouchpadRecognizer.cancel();
+        if (capturedTouchpad != null)
+            capturedTouchpad.cancel();
         capturedTouchpadBaselineValid = false;
         capturedTouchpadBaselinePointers = 0;
         capturedTouchpadLastCentroidX = 0f;
         capturedTouchpadLastCentroidY = 0f;
     }
 
-    private void sendCapturedMouseMotion(float dx, float dy) {
+    /**
+     * Move the shared cursor by a delta in view pixels and report it to the remote.
+     * Both touchpads and a captured mouse end up here.
+     */
+    private void movePointerBy(float dx, float dy) {
         if (!Float.isFinite(dx) || !Float.isFinite(dy)
                 || (dx == 0f && dy == 0f))
             return;
@@ -1185,9 +1267,7 @@ public class MainActivity extends Activity
         // ===== 重新读取触摸板设置 =====
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         isTouchpadMode = prefs.getBoolean(KEY_TOUCHPAD_MODE, false);
-        capturedTouchpadAccel = Math.max(0.5f,
-                Math.min(10.0f, prefs.getFloat(KEY_MOUSE_ACCEL, 1.0f)));
-        virtualTouchpad.setAccelStrength(capturedTouchpadAccel);
+        applyTouchpadPrefs(prefs);
         pointerCaptureEnabled = prefs.getBoolean(KEY_POINTER_CAPTURE, false);
         // A manual Back-key release lasts until the next click or lifecycle
         // transition. Returning from Settings starts a fresh capture session.
@@ -1336,7 +1416,7 @@ public class MainActivity extends Activity
         applyAudioLatency();
 
         // ===== 更新屏幕尺寸并重置平滑状态 =====
-        virtualTouchpad.onSurfaceChanged();
+        updateTouchpadBounds(null);
         if (mRoot != null)
             mRoot.post(this::syncPointerCapture);
     }
@@ -1592,7 +1672,11 @@ public class MainActivity extends Activity
 
         // ===== 触摸板模式优先处理（仅针对非鼠标触摸事件） =====
         if (isTouchpadMode && !mouseEvent) {
-            return virtualTouchpad.onTouch(event);
+            // Bounds are refreshed here as well as in surfaceChanged: the IME inset
+            // resizes the surface without going through it on every path.
+            updateTouchpadBounds(null);
+            screenTouchpad.onTouch(event);
+            return true;
         }
 
         if (mouseEvent) {
